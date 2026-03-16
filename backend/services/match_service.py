@@ -1,14 +1,14 @@
 """
 backend/services/match_service.py
-CLIP-based multi-signal matching service.
+CLIP + Gemini multi-signal matching service.
 
-Improvements v2:
-  • LRU in-memory cache for embeddings (Config.EMBEDDING_LRU_MAXSIZE)
-  • Candidate pool pre-filtered by same category + nearby location
-    before computing expensive cosine similarities
-  • All thresholds / weights from Config
-  • Type hints throughout
-  • cosine_similarity handles zero-length vectors safely
+v3 additions:
+  • Gemini visual comparison injected for top-N candidates after initial scoring
+    — gives a richer "same_item_probability" signal and populates match_reasons
+    with human-readable text from Gemini
+  • All existing CLIP / text / category signals preserved
+  • Gemini comparison is gated: only runs when images available + score > threshold
+  • Config.GEMINI_COMPARE_ENABLED flag (default True) to toggle
 """
 
 from __future__ import annotations
@@ -40,24 +40,15 @@ def _load_clip() -> tuple[Any, Any]:
         _clip_processor = CLIPProcessor.from_pretrained(Config.CLIP_MODEL_NAME)
         _clip_model     = CLIPModel.from_pretrained(Config.CLIP_MODEL_NAME)
         _clip_model.eval()
-        logger.info("clip_model_loaded", extra={"model": Config.CLIP_MODEL_NAME})
+        logger.info("clip_model_loaded model=%s", Config.CLIP_MODEL_NAME)
     except Exception as exc:
-        logger.error("clip_load_failed", extra={"error": str(exc)})
+        logger.error("clip_load_failed error=%s", exc)
         _clip_model = _clip_processor = None
     return _clip_model, _clip_processor
 
 
 # ─── Embedding helpers ────────────────────────────────────────────────────────
 def get_image_embedding(image_bytes: bytes) -> list[float] | None:
-    """
-    Compute a normalised CLIP image embedding vector.
-
-    Args:
-        image_bytes: Raw image bytes (JPEG / PNG / WEBP).
-
-    Returns:
-        512-float list (normalised) or None on failure.
-    """
     model, processor = _load_clip()
     if model is None:
         return None
@@ -71,45 +62,35 @@ def get_image_embedding(image_bytes: bytes) -> list[float] | None:
         norm = np.linalg.norm(vec)
         return (vec / norm).tolist() if norm > 0 else vec.tolist()
     except Exception as exc:
-        logger.error("image_embedding_failed", extra={"error": str(exc)})
+        logger.error("image_embedding_failed error=%s", exc)
         return None
 
 
 @lru_cache(maxsize=Config.EMBEDDING_LRU_MAXSIZE)
 def _cached_text_embedding(text: str) -> tuple[float, ...] | None:
-    """LRU-cached text embedding — cache key is the text string itself."""
     model, processor = _load_clip()
     if model is None:
         return None
     try:
         import torch
-        inputs = processor(
-            text=[text[:77]], return_tensors="pt", truncation=True, padding=True
-        )
+        inputs = processor(text=[text[:77]], return_tensors="pt", truncation=True, padding=True)
         with torch.no_grad():
             feats = model.get_text_features(**inputs)
         vec  = feats.numpy()[0]
         norm = np.linalg.norm(vec)
         result = (vec / norm).tolist() if norm > 0 else vec.tolist()
-        return tuple(result)   # tuples are hashable → work with lru_cache
+        return tuple(result)
     except Exception as exc:
-        logger.error("text_embedding_failed", extra={"error": str(exc)})
+        logger.error("text_embedding_failed error=%s", exc)
         return None
 
 
 def get_text_embedding(text: str) -> list[float] | None:
-    """Return text embedding as a list (wraps the cached tuple version)."""
     result = _cached_text_embedding(text[:200])
     return list(result) if result else None
 
 
 def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
-    """
-    Compute cosine similarity between two float vectors.
-
-    Returns:
-        Float in [0.0, 1.0].  Returns 0.0 if either vector is zero-length.
-    """
     a = np.array(vec_a, dtype=np.float32)
     b = np.array(vec_b, dtype=np.float32)
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
@@ -125,22 +106,14 @@ def find_matches_for_item(
     limit:     int   = Config.MATCH_RESULT_LIMIT,
 ) -> list[dict[str, Any]]:
     """
-    Find potential matches for ``item_id`` from the opposite type.
+    Find potential matches for ``item_id``.
 
-    Strategy:
-        1. Pre-filter candidates by same category + location proximity
-           (reduces expensive cosine comparisons)
-        2. Compute multi-signal score for each candidate
-        3. Persist / update matches collection
-        4. Return top ``limit`` results above ``threshold``
-
-    Args:
-        item_id:   MongoDB item _id string.
-        threshold: Minimum combined score to include in results.
-        limit:     Maximum number of results to return.
-
-    Returns:
-        List of match dicts sorted by score descending.
+    Pipeline:
+      1. Pre-filter candidates (same category + limit)
+      2. Multi-signal score (category, color, brand, tags, CLIP text)
+      3. For top candidates with images: Gemini visual comparison (optional)
+      4. Merge signals into final score
+      5. Persist matches + return sorted list
     """
     from config.database import get_db
     from bson import ObjectId
@@ -152,7 +125,6 @@ def find_matches_for_item(
 
     opposite_type = "found" if item["type"] == "lost" else "lost"
 
-    # ── Build candidate filter (narrow before scoring) ────────────────────
     base_filter: dict[str, Any] = {
         "type":    opposite_type,
         "status":  "active",
@@ -160,15 +132,11 @@ def find_matches_for_item(
         "user_id": {"$ne": item["user_id"]},
     }
 
-    # Same category boosts recall and reduces noise
     category = item.get("category")
     if category and category != "other":
-        # Return same-category candidates first; if < 30, add "other" too
         same_cat_ids = list(
-            db.items.find(
-                {**base_filter, "category": category},
-                {"_id": 1},
-            ).limit(Config.MATCH_CANDIDATE_LIMIT)
+            db.items.find({**base_filter, "category": category}, {"_id": 1})
+              .limit(Config.MATCH_CANDIDATE_LIMIT)
         )
         if len(same_cat_ids) < 30:
             other_ids = list(
@@ -191,14 +159,28 @@ def find_matches_for_item(
 
     candidates = list(db.items.find({"_id": {"$in": candidate_ids}}))
 
-    # ── Score each candidate ──────────────────────────────────────────────
-    matches: list[dict[str, Any]] = []
+    # ── Initial scoring ────────────────────────────────────────────────────
+    scored: list[tuple[float, dict, dict]] = []  # (score, highlights, candidate)
     for candidate in candidates:
         score, highlights = _compute_match_score(item, candidate)
+        if score >= threshold * 0.7:  # loose pre-filter before Gemini
+            scored.append((score, highlights, candidate))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # ── Gemini visual comparison for top-N candidates ──────────────────────
+    gemini_enabled = getattr(Config, "GEMINI_COMPARE_ENABLED", True)
+    gemini_top_n   = getattr(Config, "GEMINI_COMPARE_TOP_N", 5)
+
+    if gemini_enabled and item.get("images"):
+        scored = _enrich_with_gemini(db, item, scored, top_n=gemini_top_n)
+
+    # ── Final filtering + persist ──────────────────────────────────────────
+    matches: list[dict[str, Any]] = []
+    for score, highlights, candidate in scored:
         if score < threshold:
             continue
-
-        cand_id  = str(candidate["_id"])
+        cand_id = str(candidate["_id"])
         match_doc = {
             "lost_item_id":  item_id  if item["type"] == "lost"  else cand_id,
             "found_item_id": cand_id  if item["type"] == "lost"  else item_id,
@@ -212,7 +194,6 @@ def find_matches_for_item(
             {"$set": match_doc},
             upsert=True,
         )
-
         matches.append({
             "item_id":    cand_id,
             "score":      round(score, 4),
@@ -228,44 +209,111 @@ def find_matches_for_item(
                     candidate["date_occurred"].isoformat()
                     if candidate.get("date_occurred") else None
                 ),
-                "thumbnail":     candidate["images"][0]["url"] if candidate.get("images") else None,
-                "color":         candidate.get("color"),
-                "brand":         candidate.get("brand"),
-                "tags":          candidate.get("tags", []),
+                "thumbnail": candidate["images"][0]["url"] if candidate.get("images") else None,
+                "color":     candidate.get("color"),
+                "brand":     candidate.get("brand"),
+                "tags":      candidate.get("tags", []),
             },
         })
 
     matches.sort(key=lambda x: x["score"], reverse=True)
-
-    db.items.update_one(
-        {"_id": ObjectId(item_id)},
-        {"$set": {"match_count": len(matches)}},
-    )
-
+    db.items.update_one({"_id": ObjectId(item_id)}, {"$set": {"match_count": len(matches)}})
     return matches[:limit]
 
 
+# ─── Gemini visual enrichment ─────────────────────────────────────────────────
+def _enrich_with_gemini(
+    db,
+    item: dict,
+    scored: list[tuple[float, dict, dict]],
+    top_n: int = 5,
+) -> list[tuple[float, dict, dict]]:
+    """
+    For the top-N candidates that have images, call Gemini to compare them
+    visually against the source item. Blends the Gemini probability into the
+    existing score and adds match_reasons / mismatch_reasons to highlights.
+    """
+    import requests as req_lib
+    from services.gemini_service import compare_images_with_gemini
+
+    # Fetch source item's first image bytes
+    item_img_bytes: bytes | None = None
+    if item.get("images"):
+        url = item["images"][0].get("url")
+        if url:
+            try:
+                r = req_lib.get(url, timeout=8)
+                if r.ok:
+                    item_img_bytes = r.content
+            except Exception as e:
+                logger.warning("gemini_enrich: failed to fetch item image url=%s error=%s", url, e)
+
+    if not item_img_bytes:
+        return scored  # can't compare without source image
+
+    enriched: list[tuple[float, dict, dict]] = []
+
+    for idx, (score, highlights, candidate) in enumerate(scored):
+        if idx >= top_n or not candidate.get("images"):
+            enriched.append((score, highlights, candidate))
+            continue
+
+        cand_url = candidate["images"][0].get("url")
+        if not cand_url:
+            enriched.append((score, highlights, candidate))
+            continue
+
+        try:
+            r = req_lib.get(cand_url, timeout=8)
+            if not r.ok:
+                raise IOError(f"HTTP {r.status_code}")
+            cand_img_bytes = r.content
+
+            gemini_result = compare_images_with_gemini(item_img_bytes, cand_img_bytes)
+
+            if not gemini_result.get("error"):
+                gemini_prob = gemini_result.get("same_item_probability", 0.0)
+
+                # Blend: 60% existing score, 40% Gemini visual signal
+                GEMINI_WEIGHT = 0.40
+                blended_score = (score * (1 - GEMINI_WEIGHT)) + (gemini_prob * GEMINI_WEIGHT)
+
+                # Update highlights with Gemini reasons
+                highlights = dict(highlights)
+                highlights["gemini_visual_score"]    = round(gemini_prob, 3)
+                highlights["gemini_verdict"]         = gemini_result.get("verdict", "")
+                highlights["gemini_match_reasons"]   = gemini_result.get("match_reasons", [])
+                highlights["gemini_mismatch_reasons"] = gemini_result.get("mismatch_reasons", [])
+
+                logger.info(
+                    "gemini_enrich item=%s cand=%s prob=%.2f blended=%.2f",
+                    str(item.get("_id", "")), str(candidate.get("_id", "")),
+                    gemini_prob, blended_score,
+                )
+                enriched.append((blended_score, highlights, candidate))
+            else:
+                logger.warning("gemini_compare_error: %s", gemini_result.get("error"))
+                enriched.append((score, highlights, candidate))
+
+        except Exception as e:
+            logger.warning("gemini_enrich_failed cand_url=%s error=%s", cand_url, e)
+            enriched.append((score, highlights, candidate))
+
+    # Re-sort after blending
+    enriched.sort(key=lambda x: x[0], reverse=True)
+    return enriched
+
+
+# ─── CLIP visual search (unchanged) ──────────────────────────────────────────
 def search_by_image_embedding(
     image_bytes: bytes,
     limit:       int = Config.MATCH_RESULT_LIMIT,
 ) -> list[dict[str, Any]]:
-    """
-    Find items visually similar to ``image_bytes`` using stored CLIP embeddings.
-
-    Args:
-        image_bytes: Query image bytes.
-        limit:       Max results.
-
-    Returns:
-        List of items with similarity score, sorted descending.
-    """
     from config.database import get_db
-
     db        = get_db()
     query_emb = get_image_embedding(image_bytes)
 
     if query_emb is None:
-        # Fallback: return most recent active items
         items = list(db.items.find({"status": "active"}).sort("created_at", -1).limit(limit))
         return [{"item_id": str(i["_id"]), "score": 0, "score_pct": 0, "title": i["title"]} for i in items]
 
@@ -303,16 +351,12 @@ def _compute_match_score(
 ) -> tuple[float, dict[str, Any]]:
     """
     Multi-signal similarity score.
-
-    Signals and their weights (from Config):
+    Weights (from Config):
         category  : 0.30
         color     : 0.15
         brand     : 0.20
         tags      : 0.15
         text (CLIP): 0.20
-
-    Returns:
-        (score: float 0–1, highlights: dict)
     """
     highlights: dict[str, Any] = {
         "category_match": False,
@@ -321,49 +365,39 @@ def _compute_match_score(
         "tag_matches":    [],
         "text_score":     0.0,
     }
-
     score        = 0.0
     weight_total = 0.0
 
-    # ── Category ──────────────────────────────────────────────────────────
-    w = Config.MATCH_WEIGHT_CATEGORY
-    weight_total += w
+    # Category
+    w = Config.MATCH_WEIGHT_CATEGORY; weight_total += w
     cat_a, cat_b = item_a.get("category"), item_b.get("category")
     if cat_a and cat_b and cat_a == cat_b and cat_a != "other":
-        score += w
-        highlights["category_match"] = True
+        score += w; highlights["category_match"] = True
     elif cat_a and cat_b:
         score += w * 0.2
 
-    # ── Color ─────────────────────────────────────────────────────────────
-    w = Config.MATCH_WEIGHT_COLOR
-    weight_total += w
+    # Color
+    w = Config.MATCH_WEIGHT_COLOR; weight_total += w
     col_a = (item_a.get("color") or "").lower().strip()
     col_b = (item_b.get("color") or "").lower().strip()
     if col_a and col_b:
         if col_a == col_b:
-            score += w
-            highlights["color_match"] = True
+            score += w; highlights["color_match"] = True
         elif col_a in col_b or col_b in col_a:
-            score += w * 0.6
-            highlights["color_match"] = True
+            score += w * 0.6; highlights["color_match"] = True
 
-    # ── Brand ─────────────────────────────────────────────────────────────
-    w = Config.MATCH_WEIGHT_BRAND
-    weight_total += w
+    # Brand
+    w = Config.MATCH_WEIGHT_BRAND; weight_total += w
     br_a = (item_a.get("brand") or "").lower().strip()
     br_b = (item_b.get("brand") or "").lower().strip()
     if br_a and br_b and br_a not in ("unknown", "n/a"):
         if br_a == br_b:
-            score += w
-            highlights["brand_match"] = True
+            score += w; highlights["brand_match"] = True
         elif br_a in br_b or br_b in br_a:
-            score += w * 0.7
-            highlights["brand_match"] = True
+            score += w * 0.7; highlights["brand_match"] = True
 
-    # ── Tags ──────────────────────────────────────────────────────────────
-    w = Config.MATCH_WEIGHT_TAGS
-    weight_total += w
+    # Tags
+    w = Config.MATCH_WEIGHT_TAGS; weight_total += w
     tags_a = {t.lower() for t in (item_a.get("tags") or [])}
     tags_b = {t.lower() for t in (item_b.get("tags") or [])}
     if tags_a and tags_b:
@@ -371,9 +405,8 @@ def _compute_match_score(
         highlights["tag_matches"] = list(common)
         score += w * (len(common) / max(len(tags_a), len(tags_b)))
 
-    # ── Text (CLIP) ───────────────────────────────────────────────────────
-    w = Config.MATCH_WEIGHT_TEXT
-    weight_total += w
+    # Text CLIP
+    w = Config.MATCH_WEIGHT_TEXT; weight_total += w
 
     def _text(i: dict) -> str:
         return " ".join(filter(None, [
@@ -382,10 +415,8 @@ def _compute_match_score(
 
     emb_a = item_a.get("text_embedding") or get_text_embedding(_text(item_a))
     emb_b = item_b.get("text_embedding") or get_text_embedding(_text(item_b))
-
     if emb_a and emb_b:
         raw_sim = cosine_similarity(list(emb_a), list(emb_b))
-        # Normalise from [CLIP_SIM_LOW, CLIP_SIM_HIGH] → [0, 1]
         lo, hi  = Config.CLIP_SIM_LOW, Config.CLIP_SIM_HIGH
         normed  = max(0.0, (raw_sim - lo) / max(hi - lo, 1e-6))
         score  += w * normed

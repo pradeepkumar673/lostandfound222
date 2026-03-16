@@ -2,16 +2,28 @@
 import { useCallback, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Upload, Sparkles, Search } from 'lucide-react';
+import { X, Upload, Sparkles, Search, Zap } from 'lucide-react';
 import { itemsApi } from '@/lib/api';
 import { toast } from 'sonner';
-import type { Item } from '@/types';
-import ItemCard from './ItemCard';
+import { cn, getMatchBg, getMatchColor } from '@/lib/utils';
+import { useNavigate } from 'react-router-dom';
+
+// Backend returns { matches: [{ item_id, score, score_pct, title, type, category, thumbnail }] }
+interface SearchResult {
+  item_id:   string;
+  score:     number;
+  score_pct: number;
+  title:     string;
+  type:      string;
+  category:  string;
+  thumbnail: string | null;
+}
 
 export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
-  const [image, setImage] = useState<File | null>(null);
+  const navigate = useNavigate();
+  const [image, setImage]     = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
-  const [results, setResults] = useState<Item[] | null>(null);
+  const [results, setResults] = useState<SearchResult[] | null>(null);
   const [loading, setLoading] = useState(false);
 
   const onDrop = useCallback((files: File[]) => {
@@ -34,12 +46,28 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
       const fd = new FormData();
       fd.append('image', image);
       const data = await itemsApi.searchByImage(fd);
-      setResults(data);
-    } catch {
-      toast.error('Image search failed');
+
+      // Backend returns { matches: [...], count: N }
+      // Unwrap safely — handle plain array too
+      const arr: SearchResult[] = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.matches)
+          ? data.matches
+          : [];
+
+      setResults(arr);
+      if (arr.length === 0) toast.info('No visually similar items found');
+    } catch (err: unknown) {
+      toast.error(`Image search failed: ${err instanceof Error ? err.message : 'unknown'}`);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleReset = () => {
+    setPreview(null);
+    setImage(null);
+    setResults(null);
   };
 
   return (
@@ -51,13 +79,16 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
         className="glass rounded-3xl w-full max-w-2xl max-h-[90vh] overflow-y-auto no-scrollbar border border-white/10"
       >
         <div className="p-6">
+          {/* Header */}
           <div className="flex items-center justify-between mb-6">
             <div>
               <h2 className="font-display font-bold text-xl text-foreground flex items-center gap-2">
                 <Sparkles className="w-5 h-5 text-emerald-400" />
                 Visual Search
               </h2>
-              <p className="text-sm text-muted-foreground mt-0.5">Upload an image to find similar items</p>
+              <p className="text-sm text-muted-foreground mt-0.5">
+                Upload a photo — AI finds visually similar items
+              </p>
             </div>
             <button onClick={onClose} className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground">
               <X className="w-5 h-5" />
@@ -68,9 +99,10 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
           {!preview ? (
             <div
               {...getRootProps()}
-              className={`border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all ${
+              className={cn(
+                'border-2 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all',
                 isDragActive ? 'border-emerald-500 bg-emerald-500/5' : 'border-border hover:border-emerald-500/50'
-              }`}
+              )}
             >
               <input {...getInputProps()} />
               <Upload className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
@@ -80,9 +112,9 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
           ) : (
             <div className="space-y-4">
               <div className="relative rounded-2xl overflow-hidden">
-                <img src={preview} className="w-full max-h-48 object-cover" />
+                <img src={preview} className="w-full max-h-48 object-cover" alt="search" />
                 <button
-                  onClick={() => { setPreview(null); setImage(null); setResults(null); }}
+                  onClick={handleReset}
                   className="absolute top-3 right-3 glass p-1.5 rounded-lg text-white"
                 >
                   <X className="w-4 h-4" />
@@ -91,7 +123,7 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
               <button
                 onClick={handleSearch}
                 disabled={loading}
-                className="w-full btn-emerald flex items-center justify-center gap-2"
+                className="w-full btn-emerald flex items-center justify-center gap-2 disabled:opacity-60"
               >
                 {loading ? (
                   <>
@@ -114,11 +146,56 @@ export default function ImageSearchModal({ onClose }: { onClose: () => void }) {
                 className="mt-6"
               >
                 <h3 className="font-semibold text-foreground mb-3">
-                  {results.length > 0 ? `${results.length} similar items found` : 'No similar items found'}
+                  {results.length > 0
+                    ? `${results.length} similar item${results.length !== 1 ? 's' : ''} found`
+                    : 'No similar items found'}
                 </h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {results.map((item) => <ItemCard key={item.id} item={item} />)}
-                </div>
+
+                {results.length > 0 && (
+                  <div className="space-y-3">
+                    {results.map((item) => {
+                      const pct = item.score_pct ?? Math.round((item.score ?? 0) * 100);
+                      return (
+                        <motion.div
+                          key={item.item_id}
+                          whileHover={{ scale: 1.01 }}
+                          onClick={() => { navigate(`/items/${item.item_id}`); onClose(); }}
+                          className="glass rounded-2xl border border-white/5 hover:border-emerald-500/20 overflow-hidden cursor-pointer transition-all flex items-center gap-3 p-3"
+                        >
+                          {/* Thumbnail */}
+                          <div className="w-14 h-14 rounded-xl overflow-hidden bg-secondary/50 flex-shrink-0">
+                            {item.thumbnail
+                              ? <img src={item.thumbnail} className="w-full h-full object-cover" alt="" />
+                              : <div className="w-full h-full flex items-center justify-center text-xl">📦</div>
+                            }
+                          </div>
+
+                          {/* Info */}
+                          <div className="flex-1 min-w-0">
+                            <p className="font-semibold text-foreground text-sm truncate">{item.title}</p>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <span className={item.type === 'lost' ? 'badge-lost text-[10px]' : 'badge-found text-[10px]'}>
+                                {item.type === 'lost' ? '🔍 Lost' : '✅ Found'}
+                              </span>
+                              {item.category && (
+                                <span className="text-xs text-muted-foreground capitalize">{item.category}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Score */}
+                          <div className={cn(
+                            'flex items-center gap-1 px-2.5 py-1 rounded-xl border text-xs font-bold flex-shrink-0',
+                            getMatchBg(pct), getMatchColor(pct)
+                          )}>
+                            <Zap className="w-3 h-3" />
+                            {pct}%
+                          </div>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                )}
               </motion.div>
             )}
           </AnimatePresence>

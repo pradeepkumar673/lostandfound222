@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Send, MoreVertical } from 'lucide-react';
+import { X, Send, MoreVertical, Lock } from 'lucide-react';
 import { chatApi } from '@/lib/api';
 import { getSocket } from '@/lib/socket';
 import { useStore } from '@/store';
@@ -38,19 +38,27 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
   const [otherTyping, setOtherTyping] = useState(false);
   const typingTimer = useRef<ReturnType<typeof setTimeout>>();
 
-  const { data: room } = useQuery({
+  const { data: room, error: roomError } = useQuery({
     queryKey: ['chat-room', roomId],
     queryFn: () => chatApi.room(roomId),
+    retry: false,
   });
 
-  const { data: msgData } = useQuery({
+  const { data: msgData, error: msgError } = useQuery({
     queryKey: ['chat-messages', roomId],
     queryFn: () => chatApi.messages(roomId),
     refetchInterval: 5000,
+    retry: false,
   });
 
-  const messages = msgData?.items ?? [];
-  const other = room?.participants.find((p) => p.id !== currentUser?.id);
+  const messages: Message[] = (msgData?.items ?? []) as Message[];
+  const other = room?.participants?.find((p: { id: string }) => p.id !== currentUser?.id);
+
+  const is403 =
+    (roomError as Error)?.message?.includes('403') ||
+    (roomError as Error)?.message?.toLowerCase().includes('authoris') ||
+    (msgError as Error)?.message?.includes('403') ||
+    (msgError as Error)?.message?.toLowerCase().includes('authoris');
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -64,7 +72,7 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
     socket.on('message:new', (msg) => {
       qc.setQueryData(['chat-messages', roomId], (old: typeof msgData) => {
         if (!old) return old;
-        return { ...old, items: [...old.items, msg as Message] };
+        return { ...old, items: [...(old.items ?? []), msg as Message] };
       });
     });
 
@@ -82,24 +90,25 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
       socket.off('user:typing');
       socket.off('user:stop-typing');
     };
-  }, [roomId, qc, msgData]);
+  }, [roomId, qc]);
 
   const { mutate: send } = useMutation({
-    mutationFn: (content: string) => chatApi.sendMessage(roomId, content),
+    // FIX: backend expects { text: "..." } — NOT content, NOT a plain string
+    mutationFn: (content: string) => chatApi.sendMessage(roomId, { text: content }),
     onMutate: async (content) => {
       // Optimistic update
       const optimistic: Message = {
-        id: `opt-${Date.now()}`,
-        room_id: roomId,
-        sender: currentUser!,
+        id:         `opt-${Date.now()}`,
+        room_id:    roomId,
+        sender:     currentUser!,
         content,
-        type: 'text',
-        read_by: [currentUser!.id],
+        type:       'text',
+        read_by:    [currentUser!.id],
         created_at: new Date().toISOString(),
       };
       qc.setQueryData(['chat-messages', roomId], (old: typeof msgData) => {
-        if (!old) return old;
-        return { ...old, items: [...old.items, optimistic] };
+        if (!old) return { items: [optimistic], count: 1 };
+        return { ...old, items: [...(old.items ?? []), optimistic] };
       });
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['chat-messages', roomId] }),
@@ -135,20 +144,48 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
     clearTimeout(typingTimer.current);
   };
 
+  // ── 403 — not authorized to chat (not poster or claimant) ────────────────────
+  if (is403) {
+    return (
+      <div className="flex flex-col h-full w-full">
+        <div className="flex items-center gap-3 p-4 border-b border-border/30">
+          <div className="flex-1 min-w-0">
+            <p className="font-semibold text-foreground text-sm">Chat</p>
+          </div>
+          {onClose && (
+            <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground">
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center p-6 text-center gap-3">
+          <div className="w-12 h-12 rounded-2xl bg-secondary/50 flex items-center justify-center">
+            <Lock className="w-6 h-6 text-muted-foreground" />
+          </div>
+          <p className="font-semibold text-foreground text-sm">Chat is restricted</p>
+          <p className="text-xs text-muted-foreground max-w-xs leading-relaxed">
+            Only the item poster and accepted claimants can access this chat.
+            Submit a claim first to unlock the conversation.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-full w-full">
       {/* Header */}
       <div className="flex items-center gap-3 p-4 border-b border-border/30">
         <div className="w-9 h-9 rounded-full bg-emerald-500/15 border border-emerald-500/20 flex items-center justify-center overflow-hidden">
           {other?.avatar_url ? (
-            <img src={other.avatar_url} className="w-full h-full object-cover" />
+            <img src={other.avatar_url} className="w-full h-full object-cover" alt="" />
           ) : (
             <span className="text-xs font-bold text-emerald-400">{getInitials(other?.name || 'U')}</span>
           )}
         </div>
         <div className="flex-1 min-w-0">
-          <p className="font-semibold text-foreground text-sm truncate">{other?.name}</p>
-          <p className="text-xs text-emerald-400">Online</p>
+          <p className="font-semibold text-foreground text-sm truncate">{other?.name ?? 'Chat'}</p>
+          <p className="text-xs text-emerald-400">Active</p>
         </div>
         <button className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground">
           <MoreVertical className="w-4 h-4" />
@@ -162,8 +199,19 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3 no-scrollbar">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-center gap-2 py-12">
+            <p className="text-muted-foreground text-sm">No messages yet</p>
+            <p className="text-xs text-muted-foreground">Start the conversation</p>
+          </div>
+        )}
         {messages.map((msg) => {
-          const isMine = msg.sender.id === currentUser?.id;
+          const isMine = msg.sender?.id === currentUser?.id ||
+                        (msg as unknown as Record<string,string>).sender_id === currentUser?.id;
+          const senderName = msg.sender?.name ||
+                            (msg as unknown as Record<string,string>).sender_name || 'Unknown';
+          const content = msg.content ||
+                         (msg as unknown as Record<string,string>).text || '';
           return (
             <motion.div
               key={msg.id}
@@ -173,14 +221,16 @@ export default function ChatPanel({ roomId, onClose }: ChatPanelProps) {
             >
               {!isMine && (
                 <div className="w-6 h-6 rounded-full bg-secondary flex items-center justify-center flex-shrink-0 mb-1">
-                  <span className="text-[10px] font-bold text-foreground">{getInitials(msg.sender.name)}</span>
+                  <span className="text-[10px] font-bold text-foreground">{getInitials(senderName)}</span>
                 </div>
               )}
-              <div className={cn('max-w-[75%]', isMine ? 'items-end' : 'items-start', 'flex flex-col gap-1')}>
+              <div className={cn('max-w-[75%] flex flex-col gap-1', isMine ? 'items-end' : 'items-start')}>
                 <div className={isMine ? 'bubble-sent' : 'bubble-received'}>
-                  <p className="text-sm leading-relaxed">{msg.content}</p>
+                  <p className="text-sm leading-relaxed">{content}</p>
                 </div>
-                <span className="text-[10px] text-muted-foreground px-1">{formatRelativeTime(msg.created_at)}</span>
+                <span className="text-[10px] text-muted-foreground px-1">
+                  {formatRelativeTime(msg.created_at)}
+                </span>
               </div>
             </motion.div>
           );

@@ -64,6 +64,10 @@ class Config:
     GEMINI_TEMPERATURE: float     = 0.1
     GEMINI_MAX_OUTPUT_TOKENS: int = 1024
     GEMINI_CACHE_TTL_SECONDS: int = 7 * 24 * 3600
+    
+    GEMINI_COMPARE_ENABLED: bool = True
+    
+    GEMINI_COMPARE_TOP_N:   int  = 5
 
     # ML Models
     MODEL_PATH: str   = os.getenv("MODEL_PATH",   "models/categorization_model.h5")

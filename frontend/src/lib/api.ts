@@ -1,102 +1,142 @@
 // src/lib/api.ts
-import axios, { AxiosError } from 'axios';
-import type { Item, ItemFilters, PaginatedResponse, Match, ChatRoom, Message, Notification, Stats, User, Claim, AIAnalysis } from '@/types';
+import axios from 'axios';
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
-export const api = axios.create({
-  baseURL: BASE_URL,
-  headers: { 'Content-Type': 'application/json' },
-  withCredentials: true,
-});
+const api = axios.create({ baseURL: BASE_URL });
 
-// Request interceptor: attach JWT
+// ── Attach JWT ────────────────────────────────────────────────────────────────
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('clf_token');
   if (token) config.headers.Authorization = `Bearer ${token}`;
+  if (config.data instanceof FormData) {
+    delete config.headers['Content-Type'];
+  }
   return config;
 });
 
-// Response interceptor: handle 401
+// ── Surface error messages cleanly ────────────────────────────────────────────
 api.interceptors.response.use(
-  (res) => res,
-  (err: AxiosError) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem('clf_token');
-      window.location.href = '/login';
-    }
-    return Promise.reject(err);
+  (r) => r,
+  (err) => {
+    const msg =
+      err.response?.data?.error ||
+      err.response?.data?.message ||
+      err.message ||
+      'Request failed';
+    return Promise.reject(new Error(msg));
   }
 );
 
-// ─── Auth ────────────────────────────────────────────────────
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 export const authApi = {
-  login: (data: { email: string; password: string }) =>
-    api.post<{ token: string; user: User }>('/auth/login', data).then((r) => r.data),
-  register: (data: { email: string; password: string; roll_number: string; name: string; department: string }) =>
-    api.post<{ token: string; user: User }>('/auth/register', data).then((r) => r.data),
-  me: () => api.get<User>('/auth/me').then((r) => r.data),
-  logout: () => api.post('/auth/logout').then((r) => r.data),
-  updateProfile: (data: FormData) =>
-    api.patch<User>('/auth/profile', data, { headers: { 'Content-Type': 'multipart/form-data' } }).then((r) => r.data),
+  register:      (data: object) => api.post('/auth/register', data).then((r) => r.data),
+  login:         (data: object) => api.post('/auth/login', data).then((r) => r.data),
+  me:            () => api.get('/auth/me').then((r) => r.data),
+  logout:        () => api.post('/auth/logout').then((r) => r.data),
+  updateProfile: (fd: FormData) => api.patch('/auth/profile', fd).then((r) => r.data),
 };
 
-// ─── Items ────────────────────────────────────────────────────
+// ─── Items ────────────────────────────────────────────────────────────────────
 export const itemsApi = {
-  list: (filters: ItemFilters = {}) =>
-    api.get<PaginatedResponse<Item>>('/items', { params: filters }).then((r) => r.data),
-  get: (id: string) => api.get<Item>(`/items/${id}`).then((r) => r.data),
-  create: (data: FormData) =>
-    api.post<Item>('/items', data, { headers: { 'Content-Type': 'multipart/form-data' } }).then((r) => r.data),
-  update: (id: string, data: Partial<Item>) => api.patch<Item>(`/items/${id}`, data).then((r) => r.data),
-  delete: (id: string) => api.delete(`/items/${id}`).then((r) => r.data),
-  analyze: (formData: FormData) =>
-    api.post<AIAnalysis>('/items/analyze', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }).then((r) => r.data),
-  searchByImage: (formData: FormData) =>
-    api.post<Item[]>('/items/search-by-image', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-    }).then((r) => r.data),
-  markResolved: (id: string) => api.patch<Item>(`/items/${id}/resolve`).then((r) => r.data),
-  getMatches: (id: string) => api.get<Match[]>(`/items/${id}/matches`).then((r) => r.data),
-  claimItem: (id: string, message: string) =>
-    api.post<Claim>(`/items/${id}/claim`, { message }).then((r) => r.data),
-  myItems: () => api.get<Item[]>('/items/my').then((r) => r.data),
+  list:   (params?: object) => api.get('/items/', { params }).then((r) => r.data),
+  get:    (id: string)      => api.get(`/items/${id}`).then((r) => r.data),
+  create: (fd: FormData)    => api.post('/items/', fd).then((r) => r.data),
+  update: (id: string, data: object) => api.put(`/items/${id}`, data).then((r) => r.data),
+  delete: (id: string)      => api.delete(`/items/${id}`).then((r) => r.data),
+
+  // CORRECT: backend uses PUT /items/:id/status with body {status: "resolved"}
+  // NOT PATCH /items/:id/resolve — that route does not exist → was causing CORS/404
+  markResolved: (id: string) =>
+    api.put(`/items/${id}/status`, { status: 'resolved' }).then((r) => r.data),
+  resolve: (id: string) =>
+    api.put(`/items/${id}/status`, { status: 'resolved' }).then((r) => r.data),
+
+  uploadImages: (id: string, fd: FormData) =>
+    api.post(`/items/${id}/images`, fd).then((r) => r.data),
+
+  // Matches are embedded in item detail response as item.matches[]
+  getMatches: (id: string) => api.get(`/items/${id}/matches`).then((r) => r.data?.matches ?? r.data ?? []),
+  matches:    (id: string) => api.get(`/items/${id}/matches`).then((r) => r.data?.matches ?? r.data ?? []),
+
+  claim: (id: string, data: object) =>
+    api.post(`/items/${id}/claim`, data).then((r) => r.data),
+
+  // Returns plain array — unwrap paginated { items: [], pagination: {} }
+  myItems: () =>
+    api.get('/items/', { params: { my_posts: true } }).then((r) => r.data?.items ?? r.data ?? []),
+
+  // AI endpoints
+  analyze:      (fd: FormData) => api.post('/ai/full-analysis', fd).then((r) => r.data),
+  searchByImage:(fd: FormData) => api.post('/ai/search-by-image', fd).then((r) => r.data),
+  compareImages:(fd: FormData) => api.post('/ai/compare-images', fd).then((r) => r.data),
 };
 
-// ─── Matches ────────────────────────────────────────────────────
-export const matchesApi = {
-  list: () => api.get<Match[]>('/matches').then((r) => r.data),
-  get: (id: string) => api.get<Match>(`/matches/${id}`).then((r) => r.data),
-  confirm: (id: string) => api.patch<Match>(`/matches/${id}/confirm`).then((r) => r.data),
-  reject: (id: string) => api.patch<Match>(`/matches/${id}/reject`).then((r) => r.data),
-};
-
-// ─── Chat ────────────────────────────────────────────────────
-export const chatApi = {
-  rooms: () => api.get<ChatRoom[]>('/chat/rooms').then((r) => r.data),
-  room: (id: string) => api.get<ChatRoom>(`/chat/rooms/${id}`).then((r) => r.data),
-  messages: (roomId: string, page = 1) =>
-    api.get<PaginatedResponse<Message>>(`/chat/rooms/${roomId}/messages`, { params: { page } }).then((r) => r.data),
-  sendMessage: (roomId: string, content: string) =>
-    api.post<Message>(`/chat/rooms/${roomId}/messages`, { content }).then((r) => r.data),
-  createRoom: (itemId: string, participantId: string) =>
-    api.post<ChatRoom>('/chat/rooms', { item_id: itemId, participant_id: participantId }).then((r) => r.data),
-  markRead: (roomId: string) => api.patch(`/chat/rooms/${roomId}/read`).then((r) => r.data),
-};
-
-// ─── Notifications ────────────────────────────────────────────────────
-export const notificationsApi = {
-  list: (page = 1) =>
-    api.get<PaginatedResponse<Notification>>('/notifications', { params: { page } }).then((r) => r.data),
-  markRead: (id: string) => api.patch(`/notifications/${id}/read`).then((r) => r.data),
-  markAllRead: () => api.patch('/notifications/read-all').then((r) => r.data),
-  unreadCount: () => api.get<{ count: number }>('/notifications/unread-count').then((r) => r.data),
-};
-
-// ─── Stats ────────────────────────────────────────────────────
+// ─── Stats / Dashboard ────────────────────────────────────────────────────────
 export const statsApi = {
-  global: () => api.get<Stats>('/stats').then((r) => r.data),
-  heatmap: () => api.get<Array<{ lat: number; lng: number; weight: number; type: string }>>('/stats/heatmap').then((r) => r.data),
+  global:         () => api.get('/dashboard/stats').then((r) => r.data),
+  get:            () => api.get('/dashboard/stats').then((r) => r.data),
+  heatmap:        () => api.get('/dashboard/heatmap').then((r) => r.data),
+  recentActivity: () => api.get('/dashboard/activity').then((r) => r.data),
 };
+
+// ─── Chat ─────────────────────────────────────────────────────────────────────
+// Backend routes:
+//   GET  /api/chat/rooms                    → { rooms: [...] }
+//   GET  /api/chat/<item_id>/messages       → { messages: [...] }  (403 if not poster/claimant)
+//   POST /api/chat/<item_id>/messages       → send message
+// There is NO POST /api/chat/rooms
+export const chatApi = {
+  // Unwrap { rooms: [...] } → plain array
+  rooms: () => api.get('/chat/rooms').then((r) => {
+    const d = r.data;
+    return Array.isArray(d) ? d : (d?.rooms ?? []);
+  }),
+
+  // Returns a room-like object keyed by item_id
+  room: (itemId: string) => api.get(`/chat/${itemId}/messages`).then((r) => ({
+    id:          itemId,
+    item_title:  r.data?.item_title ?? '',
+    participants: [],
+    messages:    r.data?.messages ?? [],
+  })),
+
+  // Returns { items: [...] } shape that ChatPanel expects
+  messages: (itemId: string) => api.get(`/chat/${itemId}/messages`).then((r) => ({
+    items: r.data?.messages ?? [],
+    count: r.data?.count ?? 0,
+  })),
+
+  // Send message to item chat
+  // Backend expects: { content: string, type?: string }
+  // Backend expects { text: '...' } NOT { content: '...' }
+  sendMessage: (itemId: string, data: object) =>
+    api.post(`/chat/${itemId}/messages`, data).then((r) => r.data),
+
+  // No POST /chat/rooms in backend — use item_id as the room id directly
+  createRoom: (data: object) => {
+    const d = data as Record<string, string>;
+    const itemId = d.item_id ?? d.itemId ?? '';
+    return Promise.resolve({ id: itemId, room_id: itemId });
+  },
+};
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+export const notificationsApi = {
+  list:        () => api.get('/notifications/').then((r) => r.data),
+  markRead:    (id: string) => api.put(`/notifications/${id}`).then((r) => r.data),
+  markAllRead: () => api.put('/notifications/read-all').then((r) => r.data),
+  delete:      (id: string) => api.delete(`/notifications/${id}`).then((r) => r.data),
+};
+
+// ─── Matches ──────────────────────────────────────────────────────────────────
+// Backend has NO standalone /api/matches/ route.
+// Matches live inside GET /api/items/:id as item.matches[].
+// These stubs prevent crashes in MatchesPage/DashboardPage.
+export const matchesApi = {
+  list:    () => Promise.resolve([]),
+  confirm: (_id: string) => Promise.resolve({}),
+  reject:  (_id: string) => Promise.resolve({}),
+};
+
+export default api;

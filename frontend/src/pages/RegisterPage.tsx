@@ -1,6 +1,6 @@
 // src/pages/RegisterPage.tsx
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Mail, Lock, User, Hash, ChevronDown, Eye, EyeOff, ArrowRight, Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
@@ -16,15 +16,14 @@ const DEPARTMENTS = [
 ];
 
 const schema = z.object({
-  name: z.string().min(2, 'Name must be at least 2 characters'),
+  name:        z.string().min(2, 'Name must be at least 2 characters'),
   roll_number: z.string().min(3, 'Enter a valid roll number'),
-  email: z.string().email('Enter a valid email'),
-  department: z.string().min(1, 'Select your department'),
-  password: z.string().min(6, 'Password must be at least 6 characters'),
+  email:       z.string().email('Enter a valid email'),
+  department:  z.string().min(1, 'Select your department'),
+  password:    z.string().min(6, 'Password must be at least 6 characters'),
 });
 
 export default function RegisterPage() {
-  const navigate = useNavigate();
   const setAuth = useStore((s) => s.setAuth);
   const [form, setForm] = useState({ name: '', roll_number: '', email: '', department: '', password: '' });
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -49,13 +48,23 @@ export default function RegisterPage() {
     }
     setLoading(true);
     try {
-      const { user, token } = await authApi.register(form);
+      const data = await authApi.register(form);
+
+      // Backend may return either 'token' or 'access_token' — handle both
+      const token = data.token || data.access_token;
+      const user  = data.user  || data;
+
+      if (!token) {
+        toast.error('Registration failed: no token received from server');
+        return;
+      }
+
       localStorage.setItem('clf_token', token);
       setAuth(user, token);
-      toast.success(`Welcome to CampusLostFound, ${user.name.split(' ')[0]}! 🎉`);
+      toast.success(`Welcome to CampusLostFound, ${user.name?.split(' ')[0] || 'there'}! 🎉`);
       window.location.href = '/dashboard';
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || 'Registration failed';
+      const msg = (err as Error).message || 'Registration failed';
       toast.error(msg);
     } finally {
       setLoading(false);
@@ -63,9 +72,9 @@ export default function RegisterPage() {
   };
 
   const fields = [
-    { name: 'name', label: 'Full Name', icon: User, type: 'text', placeholder: 'Pradeep Kumar' },
-    { name: 'roll_number', label: 'Roll Number', icon: Hash, type: 'text', placeholder: '21CS001' },
-    { name: 'email', label: 'College Email', icon: Mail, type: 'email', placeholder: 'you@college.edu' },
+    { name: 'name',        label: 'Full Name',     icon: User, type: 'text',  placeholder: 'Pradeep Kumar' },
+    { name: 'roll_number', label: 'Roll Number',   icon: Hash, type: 'text',  placeholder: '21CS001' },
+    { name: 'email',       label: 'College Email', icon: Mail, type: 'email', placeholder: 'you@college.edu' },
   ];
 
   return (
@@ -128,7 +137,11 @@ export default function RegisterPage() {
               placeholder="Min. 6 characters"
               className={cn('input-base pl-10 pr-10', errors.password && 'border-red-500/50')}
             />
-            <button type="button" onClick={() => setShowPass(!showPass)} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+            <button
+              type="button"
+              onClick={() => setShowPass(!showPass)}
+              className="absolute right-3.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            >
               {showPass ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
             </button>
           </div>
@@ -139,7 +152,7 @@ export default function RegisterPage() {
           type="submit"
           disabled={loading}
           whileTap={{ scale: 0.98 }}
-          className="w-full btn-emerald flex items-center justify-center gap-2 mt-1 disabled:opacity-60"
+          className="w-full btn-emerald flex items-center justify-center gap-2 mt-1 disabled:opacity-60 disabled:cursor-not-allowed"
         >
           {loading ? (
             <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
@@ -151,7 +164,9 @@ export default function RegisterPage() {
 
       <p className="text-center text-sm text-muted-foreground mt-5">
         Already have an account?{' '}
-        <Link to="/login" className="text-emerald-400 hover:text-emerald-300 font-semibold">Sign in</Link>
+        <Link to="/login" className="text-emerald-400 hover:text-emerald-300 font-semibold">
+          Sign in
+        </Link>
       </p>
     </div>
   );

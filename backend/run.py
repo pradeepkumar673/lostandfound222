@@ -24,10 +24,22 @@ def run_flask() -> None:
     from app import app, socketio
     from config.settings import Config
 
-    port  = int(os.getenv("PORT", 5000))
-    debug = Config.DEBUG
-    logger.info("Starting Flask on port %s (debug=%s)", port, debug)
-    socketio.run(app, host="0.0.0.0", port=port, debug=debug, use_reloader=debug)
+    port = int(os.getenv("PORT", 5000))
+
+    logger.info("Starting Flask on port %s", port)
+
+    # allow_unsafe_werkzeug=True is required when running Flask-SocketIO
+    # with the Werkzeug dev server (not gunicorn/eventlet).
+    # Without it, SocketIO's WebSocket upgrade causes:
+    #   AssertionError: write() before start_response
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        debug=False,           # keep False — debug=True triggers reloader which breaks SocketIO
+        use_reloader=False,    # must be False with SocketIO threading mode
+        allow_unsafe_werkzeug=True,
+    )
 
 
 def run_celery() -> None:
@@ -84,7 +96,6 @@ def run_all() -> None:
 
 
 if __name__ == "__main__":
-    # ── Logging ───────────────────────────────────────────────────────────────
     from config.logging_config import configure_logging
     configure_logging()
 

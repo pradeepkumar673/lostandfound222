@@ -1,6 +1,6 @@
 // src/pages/LoginPage.tsx
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Mail, Lock, Eye, EyeOff, Sparkles, ArrowRight } from 'lucide-react';
 import { toast } from 'sonner';
@@ -15,7 +15,6 @@ const schema = z.object({
 });
 
 export default function LoginPage() {
-  const navigate = useNavigate();
   const setAuth = useStore((s) => s.setAuth);
   const [form, setForm] = useState({ email: '', password: '' });
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -40,15 +39,25 @@ export default function LoginPage() {
     }
     setLoading(true);
     try {
-      const { user, token } = await authApi.login(form);
-      // Set token in localStorage FIRST so ProtectedRoute sees it synchronously
+      const data = await authApi.login(form);
+
+      // Backend may return either 'token' or 'access_token' — handle both
+      const token = data.token || data.access_token;
+      const user  = data.user  || data;
+
+      if (!token) {
+        toast.error('Login failed: no token received from server');
+        return;
+      }
+
       localStorage.setItem('clf_token', token);
       setAuth(user, token);
-      toast.success(`Welcome back, ${user.name.split(' ')[0]}! 👋`);
-      // Use window.location for a hard redirect — bypasses any stale closure on token state
+      toast.success(`Welcome back, ${user.name?.split(' ')[0] || 'there'}! 👋`);
       window.location.href = '/dashboard';
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { message?: string } } })?.response?.data?.message || 'Invalid credentials';
+      const msg =
+        (err as Error).message ||
+        'Invalid credentials';
       toast.error(msg);
     } finally {
       setLoading(false);
@@ -120,10 +129,7 @@ export default function LoginPage() {
           {loading ? (
             <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
           ) : (
-            <>
-              Sign In
-              <ArrowRight className="w-4 h-4" />
-            </>
+            <>Sign In <ArrowRight className="w-4 h-4" /></>
           )}
         </motion.button>
       </form>
@@ -135,7 +141,7 @@ export default function LoginPage() {
         <div className="flex-1 h-px bg-border" />
       </div>
 
-      {/* Social placeholder */}
+      {/* Google placeholder */}
       <button className="w-full glass border border-border rounded-xl py-3 flex items-center justify-center gap-3 text-sm font-medium hover:bg-white/5 transition-all">
         <svg className="w-5 h-5" viewBox="0 0 24 24">
           <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
@@ -146,7 +152,6 @@ export default function LoginPage() {
         Continue with Google
       </button>
 
-      {/* Switch to register */}
       <p className="text-center text-sm text-muted-foreground mt-6">
         Don't have an account?{' '}
         <Link to="/register" className="text-emerald-400 hover:text-emerald-300 font-semibold transition-colors">
