@@ -1,4 +1,9 @@
 // src/pages/ItemDetailPage.tsx
+// FIXES:
+//   1. Matches: now fetched via GET /api/items/:id/matches (not item.matches[] which is never embedded)
+//   2. AI Analysis: shows fallback state with "Run Analysis" button when ai_analysis is null
+//   3. AI Analysis: percentage confidence shown for category
+
 import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation } from '@tanstack/react-query';
@@ -6,7 +11,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   MapPin, Clock, Tag, ChevronLeft, ChevronRight,
   MessageCircle, CheckCircle, Trash2, Zap, Sparkles,
-  Share2, GitMerge,
+  Share2, GitMerge, RefreshCw,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { itemsApi, chatApi } from '@/lib/api';
@@ -16,9 +21,9 @@ import { cn, formatRelativeTime, getInitials, getMatchBg, getMatchColor } from '
 import { queryClient } from '@/lib/queryClient';
 import ChatPanel from '@/components/chat/ChatPanel';
 import { Skeleton } from '@/components/ui/Skeleton';
+import api from '@/lib/api';
 
 // ── helpers ────────────────────────────────────────────────────────────────────
-// Backend returns images as { url, public_id, thumbnail } objects OR plain strings
 function imgUrl(img: unknown): string {
   if (!img) return '';
   if (typeof img === 'string') return img;
@@ -28,7 +33,6 @@ function imgUrl(img: unknown): string {
   return '';
 }
 
-// Backend returns poster OR owner field
 function getPoster(item: Record<string, unknown>) {
   const p = (item.poster || item.owner || {}) as Record<string, string>;
   return {
@@ -49,11 +53,22 @@ export default function ItemDetailPage() {
   const [chatRoomId, setChatRoomId] = useState<string | null>(null);
   const [claimMsg, setClaimMsg] = useState('');
   const [showClaimBox, setShowClaimBox] = useState(false);
+  const [triggeringAnalysis, setTriggeringAnalysis] = useState(false);
 
+  // ── Item detail ──────────────────────────────────────────────────────────────
   const { data: item, isLoading } = useQuery({
     queryKey: ['item', id],
     queryFn: () => itemsApi.get(id!),
     enabled: !!id,
+  });
+
+  // ── Matches: FIX — call GET /api/items/:id/matches directly ─────────────────
+  // Previously relying on item.matches[] which is NEVER embedded in GET /items/:id
+  const { data: fetchedMatches = [], isLoading: matchesLoading, refetch: refetchMatches } = useQuery({
+    queryKey: ['item-matches', id],
+    queryFn: () => itemsApi.getMatches(id!),
+    enabled: !!id,
+    staleTime: 1000 * 60,
   });
 
   const { mutate: resolve } = useMutation({
@@ -82,10 +97,28 @@ export default function ItemDetailPage() {
     onError: (err: unknown) => toast.error((err as Error).message || 'Claim failed'),
   });
 
+  // ── Trigger AI analysis manually ─────────────────────────────────────────────
+  const handleTriggerAnalysis = async () => {
+    if (!id) return;
+    setTriggeringAnalysis(true);
+    try {
+      await api.post(`/items/${id}/analyze`);
+      toast.success('AI analysis started! Refresh in a moment.');
+      // Refetch item after a short delay so ai_analysis is populated
+      setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ['item', id] });
+      }, 3000);
+    } catch (err: unknown) {
+      toast.error((err as Error).message || 'Could not start analysis');
+    } finally {
+      setTriggeringAnalysis(false);
+    }
+  };
+
   const handleStartChat = async () => {
     if (!item) return;
     try {
-      const poster = getPoster(item);
+      const poster = getPoster(item as Record<string, unknown>);
       const room = await chatApi.createRoom({
         item_id:        item.id || id,
         participant_id: poster.id,
@@ -126,21 +159,22 @@ export default function ItemDetailPage() {
   }
 
   // ── Normalise data from backend ───────────────────────────────────────────────
-  const poster    = getPoster(item);
-  const isOwner   = poster.id === currentUser?.id || item.user_id === currentUser?.id || item.is_mine;
-  const category  = CATEGORIES.find((c) => c.id === item.category);
-  const location  = item.location_name || item.campus_zone || item.location_id || '—';
+  const itemData = item as Record<string, unknown>;
+  const poster    = getPoster(itemData);
+  const isOwner   = poster.id === currentUser?.id || itemData.user_id === currentUser?.id || itemData.is_mine;
+  const category  = CATEGORIES.find((c) => c.id === itemData.category);
+  const location  = (itemData.location_name || itemData.campus_zone || itemData.location_id || '—') as string;
 
-  // Images: array of objects or strings
-  const images: string[] = Array.isArray(item.images)
-    ? item.images.map(imgUrl).filter(Boolean)
+  const images: string[] = Array.isArray(itemData.images)
+    ? (itemData.images as unknown[]).map(imgUrl).filter(Boolean)
     : [];
 
-  // Matches: backend embeds them in item.matches as { match_id, score, score_pct, highlights, item }
-  const embeddedMatches: unknown[] = Array.isArray(item.matches) ? item.matches : [];
+  // FIX: Use fetchedMatches from the dedicated /matches endpoint instead of item.matches[]
+  const matches = Array.isArray(fetchedMatches) ? fetchedMatches as Record<string, unknown>[] : [];
 
-  // Tags
-  const tags: string[] = Array.isArray(item.tags) ? item.tags : [];
+  const tags: string[] = Array.isArray(itemData.tags) ? itemData.tags as string[] : [];
+
+  const aiAnalysis = itemData.ai_analysis as Record<string, unknown> | null | undefined;
 
   return (
     <div className="flex h-full">
@@ -162,7 +196,7 @@ export default function ItemDetailPage() {
               <motion.img
                 key={imgIdx}
                 src={images[imgIdx]}
-                alt={item.title}
+                alt={itemData.title as string}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
@@ -201,12 +235,12 @@ export default function ItemDetailPage() {
 
           {/* Status badges */}
           <div className="absolute top-4 left-4 flex gap-2">
-            <span className={item.type === 'lost' ? 'badge-lost' : 'badge-found'}>
-              {item.type === 'lost' ? '🔍 Lost' : '✅ Found'}
+            <span className={(itemData.type as string) === 'lost' ? 'badge-lost' : 'badge-found'}>
+              {(itemData.type as string) === 'lost' ? '🔍 Lost' : '✅ Found'}
             </span>
-            {item.status !== 'active' && (
-              <span className={item.status === 'resolved' ? 'badge-resolved' : 'badge-claimed'}>
-                {item.status}
+            {(itemData.status as string) !== 'active' && (
+              <span className={(itemData.status as string) === 'resolved' ? 'badge-resolved' : 'badge-claimed'}>
+                {itemData.status as string}
               </span>
             )}
           </div>
@@ -230,7 +264,7 @@ export default function ItemDetailPage() {
         {/* Title + Meta + Actions */}
         <div className="flex items-start justify-between gap-4 mb-6 flex-wrap">
           <div className="flex-1 min-w-0">
-            <h1 className="font-display font-bold text-2xl md:text-3xl text-foreground mb-2">{item.title}</h1>
+            <h1 className="font-display font-bold text-2xl md:text-3xl text-foreground mb-2">{itemData.title as string}</h1>
             <div className="flex items-center gap-4 text-sm text-muted-foreground flex-wrap">
               {category && (
                 <span className="flex items-center gap-1.5 bg-secondary/50 px-3 py-1 rounded-lg">
@@ -241,10 +275,10 @@ export default function ItemDetailPage() {
                 <MapPin className="w-4 h-4 text-emerald-400" />{location}
               </span>
               <span className="flex items-center gap-1.5">
-                <Clock className="w-4 h-4" />{formatRelativeTime(item.created_at)}
+                <Clock className="w-4 h-4" />{formatRelativeTime(itemData.created_at as string)}
               </span>
-              {(item.view_count ?? 0) > 0 && (
-                <span className="text-xs">{item.view_count} views</span>
+              {((itemData.view_count as number) ?? 0) > 0 && (
+                <span className="text-xs">{itemData.view_count as number} views</span>
               )}
             </div>
           </div>
@@ -258,7 +292,7 @@ export default function ItemDetailPage() {
               <Share2 className="w-4 h-4" />
             </button>
 
-            {!isOwner && item.status === 'active' && (
+            {!isOwner && (itemData.status as string) === 'active' && (
               <>
                 <button
                   onClick={() => setShowClaimBox(!showClaimBox)}
@@ -277,7 +311,7 @@ export default function ItemDetailPage() {
 
             {isOwner && (
               <>
-                {item.status === 'active' && (
+                {(itemData.status as string) === 'active' && (
                   <button
                     onClick={() => resolve()}
                     className="px-4 py-2.5 rounded-xl bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 text-sm font-semibold flex items-center gap-2 hover:bg-emerald-500/25 transition-all"
@@ -333,26 +367,26 @@ export default function ItemDetailPage() {
         </AnimatePresence>
 
         {/* Description */}
-        {item.description && (
+        {itemData.description && (
           <div className="glass rounded-2xl p-5 border border-white/5 mb-6">
             <h3 className="font-semibold text-foreground mb-2">Description</h3>
-            <p className="text-muted-foreground text-sm leading-relaxed">{item.description}</p>
+            <p className="text-muted-foreground text-sm leading-relaxed">{itemData.description as string}</p>
           </div>
         )}
 
         {/* Details grid */}
-        {(item.color || item.brand || tags.length > 0) && (
+        {(itemData.color || itemData.brand || tags.length > 0) && (
           <div className="glass rounded-2xl p-5 border border-white/5 mb-6 grid grid-cols-2 sm:grid-cols-3 gap-4">
-            {item.color && (
+            {itemData.color && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Color</div>
-                <div className="text-sm font-medium text-foreground capitalize">{item.color}</div>
+                <div className="text-sm font-medium text-foreground capitalize">{itemData.color as string}</div>
               </div>
             )}
-            {item.brand && (
+            {itemData.brand && (
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Brand</div>
-                <div className="text-sm font-medium text-foreground">{item.brand}</div>
+                <div className="text-sm font-medium text-foreground">{itemData.brand as string}</div>
               </div>
             )}
             {tags.length > 0 && (
@@ -372,53 +406,136 @@ export default function ItemDetailPage() {
           </div>
         )}
 
-        {/* AI Analysis */}
-        {item.ai_analysis && (
-          <details className="glass rounded-2xl border border-emerald-500/10 mb-6 overflow-hidden group">
-            <summary className="p-5 flex items-center gap-2 cursor-pointer list-none">
-              <Sparkles className="w-4 h-4 text-emerald-400" />
-              <span className="font-semibold text-foreground text-sm">AI Analysis</span>
-              <span className="ml-auto text-xs text-muted-foreground group-open:rotate-180 transition-transform">▼</span>
-            </summary>
-            <div className="px-5 pb-5 border-t border-border/30 pt-4 space-y-2">
-              <p className="text-sm text-muted-foreground">
-                {item.ai_analysis.gemini_summary || item.ai_analysis.suggested_description || ''}
-              </p>
-              {Array.isArray(item.ai_analysis.features) && item.ai_analysis.features.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 pt-1">
-                  {item.ai_analysis.features.map((f: string) => (
-                    <span key={f} className="text-xs px-2.5 py-1 bg-emerald-500/10 text-emerald-400 rounded-lg border border-emerald-500/20">
-                      {f}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </div>
-          </details>
-        )}
+        {/* ── AI Analysis (FIX: show even when null, with trigger button) ── */}
+        <details className="glass rounded-2xl border border-emerald-500/10 mb-6 overflow-hidden group" open={!!aiAnalysis}>
+          <summary className="p-5 flex items-center gap-2 cursor-pointer list-none">
+            <Sparkles className="w-4 h-4 text-emerald-400" />
+            <span className="font-semibold text-foreground text-sm">AI Analysis</span>
+            <span className="ml-auto text-xs text-muted-foreground group-open:rotate-180 transition-transform">▲</span>
+          </summary>
+          <div className="px-5 pb-5 border-t border-border/30 pt-4">
+            {aiAnalysis ? (
+              <div className="space-y-3">
+                {/* Gemini summary */}
+                {(aiAnalysis.gemini_summary || aiAnalysis.suggested_description) && (
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    {(aiAnalysis.gemini_summary || aiAnalysis.suggested_description) as string}
+                  </p>
+                )}
 
-        {/* AI Matches — backend embeds as item.matches */}
-        {embeddedMatches.length > 0 && (
-          <div className="mb-6">
-            <h3 className="font-semibold text-foreground mb-3 flex items-center gap-2">
+                {/* Category confidence */}
+                {aiAnalysis.category_confidence !== undefined && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-muted-foreground">Category confidence</span>
+                    <div className="flex-1 h-1.5 bg-secondary rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 rounded-full"
+                        style={{ width: `${Math.round((aiAnalysis.category_confidence as number) * 100)}%` }}
+                      />
+                    </div>
+                    <span className="text-xs font-bold text-emerald-400">
+                      {Math.round((aiAnalysis.category_confidence as number) * 100)}%
+                    </span>
+                  </div>
+                )}
+
+                {/* Features */}
+                {Array.isArray(aiAnalysis.features) && (aiAnalysis.features as string[]).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {(aiAnalysis.features as string[]).map((f) => (
+                      <span key={f} className="text-xs px-2.5 py-1 bg-emerald-500/10 text-emerald-400 rounded-lg border border-emerald-500/20">
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Tags from AI */}
+                {Array.isArray(aiAnalysis.tags) && (aiAnalysis.tags as string[]).length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {(aiAnalysis.tags as string[]).map((t) => (
+                      <span key={t} className="text-xs px-2 py-0.5 bg-secondary text-muted-foreground rounded-lg border border-border">
+                        #{t}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* FIX: Show fallback when no AI analysis yet */
+              <div className="flex flex-col items-center gap-3 py-3 text-center">
+                <p className="text-sm text-muted-foreground">
+                  {images.length === 0
+                    ? 'No images uploaded — AI analysis requires at least one image.'
+                    : 'AI analysis not yet run for this item.'}
+                </p>
+                {isOwner && images.length > 0 && (
+                  <button
+                    onClick={handleTriggerAnalysis}
+                    disabled={triggeringAnalysis}
+                    className="flex items-center gap-2 px-4 py-2 bg-emerald-500/15 text-emerald-400 border border-emerald-500/20 rounded-xl text-sm font-semibold hover:bg-emerald-500/25 transition-all disabled:opacity-60"
+                  >
+                    <RefreshCw className={cn('w-4 h-4', triggeringAnalysis && 'animate-spin')} />
+                    {triggeringAnalysis ? 'Running analysis...' : 'Run AI Analysis'}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </details>
+
+        {/* ── AI Matches (FIX: from dedicated /matches endpoint) ── */}
+        <div className="mb-6">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-semibold text-foreground flex items-center gap-2">
               <GitMerge className="w-4 h-4 text-emerald-400" />
-              AI Matches ({embeddedMatches.length})
+              AI Matches
+              {matchesLoading ? (
+                <span className="text-xs text-muted-foreground font-normal">(loading...)</span>
+              ) : (
+                <span className="text-xs text-muted-foreground font-normal">({matches.length})</span>
+              )}
             </h3>
+            <button
+              onClick={() => refetchMatches()}
+              disabled={matchesLoading}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-all"
+            >
+              <RefreshCw className={cn('w-3 h-3', matchesLoading && 'animate-spin')} />
+              Refresh
+            </button>
+          </div>
+
+          {matchesLoading ? (
             <div className="flex gap-3 overflow-x-auto no-scrollbar pb-2">
-              {embeddedMatches.map((match: unknown) => {
-                const m = match as Record<string, unknown>;
-                const matchedItem = m.item as Record<string, unknown> | undefined;
+              {[...Array(3)].map((_, i) => (
+                <div key={i} className="flex-shrink-0 w-48 h-40 bg-secondary/30 rounded-2xl animate-pulse" />
+              ))}
+            </div>
+          ) : matches.length === 0 ? (
+            <div className="glass rounded-2xl p-5 border border-dashed border-border text-center">
+              <p className="text-sm text-muted-foreground">
+                No matches found yet.{' '}
+                {!(itemData.ai_processed as boolean)
+                  ? 'AI is still processing this item.'
+                  : 'The AI found no strong matches currently.'}
+              </p>
+            </div>
+          ) : (
+            <div className="flex gap-3 overflow-x-auto no-scrollbar pb-2">
+              {matches.map((m, mi) => {
+                const matchedItem = (m.item as Record<string, unknown>) ?? null;
                 if (!matchedItem) return null;
-                const scorePct = (m.score_pct as number) ?? Math.round((m.score as number) * 100);
+                const scorePct = (m.score_pct as number) ?? Math.round(((m.score as number) ?? 0) * 100);
                 const thumb = imgUrl(
-                  Array.isArray(matchedItem.images) ? matchedItem.images[0] : matchedItem.thumbnail
-                ) || matchedItem.thumbnail as string || '';
+                  Array.isArray(matchedItem.images) ? (matchedItem.images as unknown[])[0] : matchedItem.thumbnail
+                ) || (matchedItem.thumbnail as string) || '';
                 return (
                   <motion.div
-                    key={m.match_id as string || matchedItem.id as string}
+                    key={(m.match_id as string) || (matchedItem.id as string) || mi}
                     whileHover={{ scale: 1.02 }}
-                    className="glass rounded-2xl border border-white/5 overflow-hidden flex-shrink-0 w-48 cursor-pointer"
-                    onClick={() => navigate(`/items/${matchedItem.id}`)}
+                    className="glass rounded-2xl border border-white/5 overflow-hidden flex-shrink-0 w-48 cursor-pointer hover:border-emerald-500/20 transition-all"
+                    onClick={() => navigate(`/items/${matchedItem.id as string}`)}
                   >
                     <div className="h-28 overflow-hidden bg-secondary/50">
                       {thumb
@@ -430,16 +547,16 @@ export default function ItemDetailPage() {
                       <p className="text-xs font-semibold text-foreground truncate mb-1.5">
                         {matchedItem.title as string}
                       </p>
-                      <span className={cn('text-xs font-bold px-2 py-0.5 rounded-lg border', getMatchBg(scorePct), getMatchColor(scorePct))}>
-                        <Zap className="w-2.5 h-2.5 inline mr-0.5" />{scorePct}% match
+                      <span className={cn('text-xs font-bold px-2 py-0.5 rounded-lg border flex items-center gap-1 w-fit', getMatchBg(scorePct), getMatchColor(scorePct))}>
+                        <Zap className="w-2.5 h-2.5" />{scorePct}% match
                       </span>
                     </div>
                   </motion.div>
                 );
               })}
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Owner card */}
         <div className="glass rounded-2xl p-5 border border-white/5 flex items-center gap-4">
