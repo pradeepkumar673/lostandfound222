@@ -1,4 +1,7 @@
 // src/pages/LoginPage.tsx
+// FIX: call connectSocket() immediately after login so the socket
+// authenticates with the fresh token instead of failing with socket_auth_no_token
+
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
@@ -7,17 +10,18 @@ import { toast } from 'sonner';
 import { z } from 'zod';
 import { authApi } from '@/lib/api';
 import { useStore } from '@/store';
+import { connectSocket } from '@/lib/socket';
 import { cn } from '@/lib/utils';
 
 const schema = z.object({
-  email: z.string().email('Please enter a valid email'),
+  email:    z.string().email('Please enter a valid email'),
   password: z.string().min(6, 'Password must be at least 6 characters'),
 });
 
 export default function LoginPage() {
   const setAuth = useStore((s) => s.setAuth);
-  const [form, setForm] = useState({ email: '', password: '' });
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [form, setForm]       = useState({ email: '', password: '' });
+  const [errors, setErrors]   = useState<Record<string, string>>({});
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
 
@@ -52,13 +56,15 @@ export default function LoginPage() {
 
       localStorage.setItem('clf_token', token);
       setAuth(user, token);
+
+      // FIX: connect socket immediately with the fresh token
+      // Previously socket had no token → socket_auth_no_token spam
+      connectSocket();
+
       toast.success(`Welcome back, ${user.name?.split(' ')[0] || 'there'}! 👋`);
       window.location.href = '/dashboard';
     } catch (err: unknown) {
-      const msg =
-        (err as Error).message ||
-        'Invalid credentials';
-      toast.error(msg);
+      toast.error((err as Error).message || 'Invalid credentials');
     } finally {
       setLoading(false);
     }
@@ -129,7 +135,7 @@ export default function LoginPage() {
           {loading ? (
             <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
           ) : (
-            <>Sign In <ArrowRight className="w-4 h-4" /></>
+            <> Sign In <ArrowRight className="w-4 h-4" /> </>
           )}
         </motion.button>
       </form>
